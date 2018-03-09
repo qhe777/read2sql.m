@@ -1,0 +1,185 @@
+%% Initialize variables.
+%Initialize the name, path, date of the file needed to read
+file_path='W:\mypath';
+file_type='filename.';
+file_date=datetime(datestr(datenum(date)-1));
+delimiter = ',';
+formatSpec = '%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%q%[^\n\r]';
+
+%Initialize Categories and Account Number
+Cate=[{'AsOfDate'} {'Account Number'} {'tradingItemId'} {'companyId'} {'CUSIP'} {'Ticker'} {'Security Type'} {'Shares'} {'Price'}];
+colnames=[{'AsOfDate'} {'AccountId'} {'tradingItemId'} {'companyId'} {'Cusip'} {'Ticker'} {'AssetClassId'} {'Shares'} {'MktValue'}];
+Double_Cate=[{'Security Type'} {'Shares'} {'Price'}];
+Accunt_Number=[{'19-0001'} {'19-0002'} {'19-0003'}];
+
+%Initialize the max-count and interval of recapturing the file if failed 
+max_count=10;
+interval=30*60;
+
+%Initialize the SQL data source
+data_source='mySQLdatabase';
+username='';
+password='';
+tablename = '[ciqdata].[dbo].[Portfolio_Positions]';
+map_name='[TargetDB].[dbo].[ciqSymbol]';
+%% Import data from a text file as a matrix.
+date_num=year(file_date)*10000+month(file_date)*100+day(file_date);
+myfile=sprintf('%s%d.csv',file_type,date_num);
+myfullfile=fullfile(file_path,myfile);
+fileID = fopen(myfullfile,'r');
+
+%Try to read file form 3am to 8 am every 30 minutes (10 times)
+count=0;
+while count<max_count+1
+    try 
+        dataArray = textscan(fileID, formatSpec, inf,'Delimiter', delimiter, 'HeaderLines', 0, 'ReturnOnError', false, 'EndOfLine', '\r\n');
+        count=(max_count+2);
+    catch ME
+        if (strcmp(ME.identifier,'MATLAB:FileIO:InvalidFid'))
+            pause(interval)
+            count=count+1;
+            disp(count)
+            if count==(max_count+1)
+                disp('no data avaliable')
+                return
+            end            
+        end
+    end
+end
+%Output data 
+fclose(fileID);
+tao1 = [dataArray{1:end-1}];
+
+%% Extract the data wanted as a cell matrix
+
+%Capture account numbers we want
+% Accunt_Number=[{'19-6839'} {'19-6840'} {'19-6841'}];
+mysize=size(tao1);
+Row_tao1=mysize(1);
+Col_tao1=mysize(2);
+
+Acc_Indv=struct();
+fields=[];                %record account number
+Col_Num=numel(Cate);
+for i=Accunt_Number
+    adr=[];
+    for k=1:Row_tao1
+        if any(strcmp(tao1(k,1),i))
+            adr=[adr k];
+        end
+    end
+    %Capture the catogeries we want
+    Row_Num=numel(adr);
+    table=cell(Row_Num,Col_Num);
+    for k=1:Col_tao1
+        col_loc=strcmp(Cate,tao1(2,k));
+        if any(col_loc)       
+            Vars=cell.empty(Row_Num,0);
+            if any(strcmp(Double_Cate,tao1(2,k)))
+                for j=1:Row_Num
+                    Vars(j)={str2double(tao1(adr(j),k))};
+                end
+            else
+                for j=1:Row_Num
+                    Vars(j)=tao1(adr(j),k);
+                end
+            end
+            table(:,col_loc)=Vars;
+        end
+    end
+    field=sprintf('a%d',find(strcmp(Accunt_Number,i)));
+    Acc_Indv.(field)=table;
+    fields=[fields {field}];
+end
+
+%% Find the repeating Cusip in a same account
+Holds=[];
+csp_c=5;
+shr_c=8;
+for i=fields
+    table=Acc_Indv.(i{1});
+    UniqueID=transpose(unique(table(:,csp_c)));
+    for j=1:numel(UniqueID)
+        adr=transpose(find(strcmp(UniqueID(j),table(:,csp_c))));
+        junk=sum([table{adr,shr_c}]);
+        if junk~=0
+            temp=table(adr(1),:);
+            temp{shr_c}=junk;
+            Holds=[Holds; temp];
+        end
+    end
+end
+
+%% Reform the output
+Holds(:,1)={datestr(file_date,29)};
+size_holds=size(Holds);
+for i=1:size_holds(1)
+    %Transform the Account Number to AccountId
+    Chars=Holds{i,2};
+    Nums=str2double([Chars(1:2),Chars(4:7)]); 
+    Holds{i,2}=Nums;
+    %Calculate the market value by multiplying the Shares and Prices
+    Holds{i,9}=Holds{i,8}*Holds{i,9};
+    %Add some temporay meaningless number as AccountId and tradingItemId
+    Holds{i,3}=-i;
+    Holds{i,4}=-i;
+    %Transform the Security Type to AssetClassId
+    if Holds{i,7}==34
+        Holds{i,7}=3;
+    elseif isnan(Holds{i,7})
+        Holds{i,3}=0;
+        Holds{i,4}=0;
+        Holds{i,5}=0;
+        Holds{i,6}=0;
+        Holds{i,7}=5;
+        Holds{i,8}=0;
+    elseif Holds{i,7}==22
+        Holds{i,7}=4;
+    end
+end
+save('holdings.mat','Holds')
+
+%% Upload the Holds data to SQL data table
+
+disp('Got it');
+load('holdings.mat');
+try
+    conn = database(data_source, username, password);
+    conn.Message;
+    insertdata = Holds;
+    fastinsert(conn,tablename,colnames,insertdata);
+
+    %Map the Cusip between tradeItemId and companyId
+    updatequery1=sprintf(['update %s '...
+        'set [tradingItemId]=[objectId], companyId=[relatedCompanyId] '...
+        'from %s inner join %s on [Cusip]=[symbolValue] '...
+        'where AsOfDate=''%s'' '...
+        'and (activeFlag=1 or (symbolEndDate>= Convert(datetime, ''%s'') '...
+        'and symbolStartDate< Convert(datetime, ''%s''))) '...
+        'and symbolTypeId=15'],...
+        tablename, tablename, map_name,...
+        datestr(file_date,29),datestr(file_date,29),datestr(file_date,29));
+    curs=exec(conn,updatequery1);
+    close(curs);
+
+    %CompanyId should be Null if the asset is cash
+    updatequery2=sprintf(['update %s set companyId=Null'...
+        ' where AssetClassId=5 and AsOfDate=''%s'''],tablename, datestr(file_date,29));
+    curs=exec(conn,updatequery2);
+    close(curs);
+    
+    %test result and seeout the assets without cusip_map
+    selectquery = sprintf(['SELECT * FROM [ciqdata_copy].[dbo].[Portfolio_Positions]'...
+        'where AsOfDate=''%s'' and tradingItemId<0'],datestr(file_date,29));
+    curs=exec(conn,selectquery);
+    curs=fetch(curs);
+    disp(curs.Data)
+    close(curs)
+    
+    close(conn);
+catch me
+    me.identifier
+end
+
+
+
